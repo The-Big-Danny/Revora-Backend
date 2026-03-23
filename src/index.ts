@@ -1,8 +1,12 @@
-import "dotenv/config";
-import express, { Request, Response } from "express";
-import morgan from "morgan";
-import { dbHealth, closePool } from "./db/client";
-import { createCorsMiddleware } from "./middleware/cors";
+import 'dotenv/config';
+import { randomUUID } from 'crypto';
+import express, { NextFunction, Request, RequestHandler, Response } from 'express';
+import morgan from 'morgan';
+import { closePool, dbHealth, query as dbQuery } from './db/client';
+import { createCorsMiddleware } from './middleware/cors';
+import { errorHandler } from './middleware/errorHandler';
+import { Errors } from './lib/errors';
+import { createHealthRouter } from './routes/health';
 import {
   createMilestoneValidationRouter,
   DomainEventPublisher,
@@ -11,12 +15,10 @@ import {
   MilestoneValidationEvent,
   MilestoneValidationEventRepository,
   VerifierAssignmentRepository,
-} from "./vaults/milestoneValidationRoute";
+} from './vaults/milestoneValidationRoute';
 
-const app = express();
 const port = process.env.PORT ?? 3000;
 const API_VERSION_PREFIX = process.env.API_VERSION_PREFIX ?? '/api/v1';
-const apiRouter = express.Router();
 
 class InMemoryMilestoneRepository implements MilestoneRepository {
   constructor(private readonly milestones = new Map<string, Milestone>()) {}
@@ -42,15 +44,16 @@ class InMemoryMilestoneRepository implements MilestoneRepository {
     const current = this.milestones.get(key);
 
     if (!current) {
-      throw new Error("Milestone not found");
+      throw Errors.notFound('Milestone not found');
     }
 
     const updated: Milestone = {
       ...current,
-      status: "validated",
+      status: 'validated',
       validated_by: input.verifierId,
       validated_at: input.validatedAt,
     };
+
     this.milestones.set(key, updated);
     return updated;
   }
@@ -67,8 +70,10 @@ class InMemoryVerifierAssignmentRepository implements VerifierAssignmentReposito
   }
 }
 
-class InMemoryMilestoneValidationEventRepository implements MilestoneValidationEventRepository {
-  private events: MilestoneValidationEvent[] = [];
+class InMemoryMilestoneValidationEventRepository
+  implements MilestoneValidationEventRepository
+{
+  private readonly events: MilestoneValidationEvent[] = [];
   private counter = 0;
 
   async create(input: {
@@ -85,6 +90,7 @@ class InMemoryMilestoneValidationEventRepository implements MilestoneValidationE
       verifier_id: input.verifierId,
       created_at: input.createdAt,
     };
+
     this.events.push(event);
     return event;
   }
@@ -100,16 +106,20 @@ class ConsoleDomainEventPublisher implements DomainEventPublisher {
   }
 }
 
-const requireAuth = (req: Request, res: Response, next: () => void): void => {
-  const userId = req.header("x-user-id");
-  const role = req.header("x-user-role");
+const requireAuth: RequestHandler = (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void => {
+  const userId = req.header('x-user-id');
+  const role = req.header('x-user-role');
 
   if (!userId || !role) {
-    res.status(401).json({ error: "Unauthorized" });
+    next(Errors.unauthorized());
     return;
   }
 
-  (req as any).user = {
+  (req as Request & { user?: { id: string; role: string } }).user = {
     id: userId,
     role,
   };
@@ -117,70 +127,111 @@ const requireAuth = (req: Request, res: Response, next: () => void): void => {
   next();
 };
 
-const milestoneRepository = new InMemoryMilestoneRepository(
-  new Map<string, Milestone>([
-    [
-      "vault-1:milestone-1",
-      {
-        id: "milestone-1",
-        vault_id: "vault-1",
-        status: "pending",
-      },
-    ],
-  ]),
-);
-const verifierAssignmentRepository = new InMemoryVerifierAssignmentRepository(
-  new Map<string, Set<string>>([["vault-1", new Set(["verifier-1"])]]),
-);
-const milestoneValidationEventRepository =
-  new InMemoryMilestoneValidationEventRepository();
-const domainEventPublisher = new ConsoleDomainEventPublisher();
+function createMilestoneDependencies() {
+  const milestoneRepository = new InMemoryMilestoneRepository(
+    new Map<string, Milestone>([
+      [
+        'vault-1:milestone-1',
+        {
+          id: 'milestone-1',
+          vault_id: 'vault-1',
+          status: 'pending',
+        },
+      ],
+    ]),
+  );
 
-app.use(createCorsMiddleware());
-app.use(express.json());
-app.use(morgan("dev"));
-app.use(
-app.use(morgan('dev'));
-app.use(API_VERSION_PREFIX, apiRouter);
+  const verifierAssignmentRepository = new InMemoryVerifierAssignmentRepository(
+    new Map<string, Set<string>>([['vault-1', new Set(['verifier-1'])]]),
+  );
 
-apiRouter.use(
-  createMilestoneValidationRouter({
-    requireAuth,
+  const milestoneValidationEventRepository =
+    new InMemoryMilestoneValidationEventRepository();
+  const domainEventPublisher = new ConsoleDomainEventPublisher();
+
+  return {
     milestoneRepository,
     verifierAssignmentRepository,
     milestoneValidationEventRepository,
     domainEventPublisher,
-  }),
-);
+  };
+}
 
-app.get("/health", async (_req: Request, res: Response) => {
-  const db = await dbHealth();
-  res.status(db.healthy ? 200 : 503).json({
-    status: db.healthy ? "ok" : "degraded",
-    service: "revora-backend",
-    db,
+/**
+ * Main Express application entrypoint.
+ *
+ * Security assumptions:
+ * - only `AppError` instances are allowed to control client-visible messages;
+ * - unknown failures are sanitized by the global error handler;
+ * - request ids are generated per request to correlate server-side logs.
+ */
+export function createApp(): express.Express {
+  const app = express();
+  const apiRouter = express.Router();
+  const milestoneDeps = createMilestoneDependencies();
+
+  app.use((req, _res, next) => {
+    (req as Request & { requestId?: string }).requestId =
+      req.header('x-request-id') ?? randomUUID();
+    next();
   });
-});
+  app.use(createCorsMiddleware());
+  app.use(express.json());
+  app.use(morgan('dev'));
 
-app.get("/api/overview", (_req: Request, res: Response) => {
-apiRouter.get('/overview', (_req: Request, res: Response) => {
-  res.json({
-    name: "Stellar RevenueShare (Revora) Backend",
-    description:
-      "Backend API skeleton for tokenized revenue-sharing on Stellar (offerings, investments, revenue distribution).",
+  app.get('/health', async (_req: Request, res: Response) => {
+    const db = await dbHealth();
+    res.status(db.healthy ? 200 : 503).json({
+      status: db.healthy ? 'ok' : 'degraded',
+      service: 'revora-backend',
+      db,
+    });
   });
-});
 
-const shutdown = async (signal: string) => {
-  console.log(`\n[server] ${signal} DB shutting down…`);
+  app.use('/health', createHealthRouter({ query: dbQuery }));
+
+  apiRouter.get('/overview', (_req: Request, res: Response) => {
+    res.json({
+      name: 'Stellar RevenueShare (Revora) Backend',
+      description:
+        'Backend API skeleton for tokenized revenue-sharing on Stellar (offerings, investments, revenue distribution).',
+      version: '0.1.0',
+    });
+  });
+
+  apiRouter.use(
+    createMilestoneValidationRouter({
+      requireAuth,
+      ...milestoneDeps,
+    }),
+  );
+
+  app.use(API_VERSION_PREFIX, apiRouter);
+  app.use((_req, _res, next) => next(Errors.notFound('Route not found')));
+  app.use(errorHandler);
+
+  return app;
+}
+
+async function shutdown(signal: string): Promise<void> {
+  // eslint-disable-next-line no-console
+  console.log(`\n[server] ${signal} shutting down`);
   await closePool();
   process.exit(0);
-};
+}
 
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+if (require.main === module) {
+  const app = createApp();
 
-app.listen(port, () => {
-  // eslint-disable-next-line no-console
-  console.log(`revora-backend listening on http://localhost:${port}`);
-});
+  process.on('SIGTERM', () => {
+    void shutdown('SIGTERM');
+  });
+  process.on('SIGINT', () => {
+    void shutdown('SIGINT');
+  });
+
+  app.listen(port, () => {
+    // eslint-disable-next-line no-console
+    console.log(`revora-backend listening on http://localhost:${port}`);
+  });
+}
